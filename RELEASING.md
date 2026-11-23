@@ -5,12 +5,8 @@ version is `0.1.0`. A dry run does not reserve the crate name.
 
 ## First publication
 
-1. Create the remote repository and push this standalone repository. For example:
-
-   ```sh
-   gh auth login
-   gh repo create MattGson/coherent-cache --public --source=. --remote=origin --push
-   ```
+1. The public repository is already hosted at
+   https://github.com/MattGson/coherent-cache. Push release preparation commits to `main`.
 
 2. Confirm the repository URL in `[package]` matches the remote you created:
 

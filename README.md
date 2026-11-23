@@ -10,14 +10,16 @@ queries, filtering, and domain conversion in your application.
 ## Status and installation
 
 Version `0.1.0` is prepared for its first publication; it is not yet on crates.io.
-Until publication, use a local path to this repository:
+Until publication, use the public Git repository:
 
 ```toml
 [dependencies]
-coherent-cache = { path = "../coherent-cache" }
+coherent-cache = { git = "https://github.com/MattGson/coherent-cache", version = "0.1.0" }
 ```
 
-After publication, use `coherent-cache = "0.1.0"`. Requires Rust 1.88 or later,
+Commit your application lockfile to pin the resolved Git revision. You can also
+add a `rev` field to select an exact commit. After publication, use
+`coherent-cache = "0.1.0"`. Requires Rust 1.88 or later,
 Tokio, SeaORM 1.1, and PostgreSQL. The library uses native TLS; Linux builds need
 OpenSSL development headers and `pkg-config`.
 

@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{OtherRecord, Record, RecordKey};
-use sea_orm::Database;
+use sea_orm::{Database, TransactionTrait};
 use sea_orm_migration::SchemaManager;
 
 async fn wait(mut condition: impl FnMut() -> bool) {
@@ -372,23 +372,70 @@ async fn cancelled_commit_still_invalidates_and_multi_entity_truncate_works() {
         .await
         .unwrap();
     w.commit().await.unwrap();
-    // Block COMMIT in a deferred trigger so cancellation is deterministic.
-    db.execute_unprepared("CREATE OR REPLACE FUNCTION cache_test_slow_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.2); RETURN NULL; END $$;
-        CREATE CONSTRAINT TRIGGER cache_test_delay AFTER INSERT ON cache_test_records DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION cache_test_slow_commit();").await.unwrap();
+    // Hold COMMIT in a deferred trigger until the caller has definitely been cancelled.
+    // Fixed sleeps can abort before the task starts or check the cache before commit finishes
+    // on a busy CI runner, neither of which tests cancellation during an in-progress commit.
+    let blocker = db.begin().await.unwrap();
+    blocker
+        .execute_unprepared("SELECT pg_advisory_xact_lock(836004201)")
+        .await
+        .unwrap();
+    db.execute_unprepared("CREATE OR REPLACE FUNCTION cache_test_blocked_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(836004201); RETURN NULL; END $$;
+        CREATE CONSTRAINT TRIGGER cache_test_delay AFTER INSERT ON cache_test_records DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION cache_test_blocked_commit();").await.unwrap();
     let cancelled_id = uuid::Uuid::new_v4();
     assert!(reads(&node.cache, &db, cancelled_id).await.is_none());
     let w = node.cache.entity::<Record>().begin_write().await.unwrap();
     insert(w.connection(), cancelled_id, group, "detached").await;
+    let writer_pid: i32 = w
+        .connection()
+        .query_one(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT pg_backend_pid() AS pid",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "pid")
+        .unwrap();
+    let invalidations = node.cache.0.state.lock().unwrap().scopes
+        [&TableIdentity::of::<Record>().key()]
+        .local_invalidations;
     let commit = tokio::spawn(async move { w.commit().await });
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let waiting: bool = db
+                .query_one(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND NOT granted) AS waiting",
+                    [writer_pid.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "waiting")
+                .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("commit did not reach its deferred trigger");
     commit.abort();
-    let _ = commit.await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(commit.await.unwrap_err().is_cancelled());
+    blocker.commit().await.unwrap();
+    wait(|| {
+        node.cache.0.state.lock().unwrap().scopes[&TableIdentity::of::<Record>().key()]
+            .local_invalidations
+            > invalidations
+    })
+    .await;
     assert_eq!(
         reads(&node.cache, &db, cancelled_id).await.as_deref(),
         Some("detached")
     );
-    db.execute_unprepared("DROP TRIGGER cache_test_delay ON cache_test_records; DROP FUNCTION cache_test_slow_commit()").await.unwrap();
+    db.execute_unprepared("DROP TRIGGER cache_test_delay ON cache_test_records; DROP FUNCTION cache_test_blocked_commit()").await.unwrap();
     let w = node.cache.entity::<Record>().begin_write().await.unwrap();
     w.connection()
         .execute_unprepared("TRUNCATE cache_test_records")
