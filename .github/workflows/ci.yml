@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Rust ${{ matrix.rust }} / PostgreSQL ${{ matrix.postgres }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: '1.88.0'
+            postgres: '13'
+          - rust: stable
+            postgres: '17'
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: '1'
+      CACHE_TEST_DATABASE_URL: postgres://postgres:test-only@localhost:5432/cache_test
+      DATABASE_URL: postgres://postgres:test-only@localhost:5432/cache_example
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_PASSWORD: test-only
+          POSTGRES_DB: cache_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install dependencies and toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libssl-dev pkg-config postgresql-client
+          rustup toolchain install "${{ matrix.rust }}" --profile minimal --component clippy --component rustfmt
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.rust }}-pg${{ matrix.postgres }}-${{ hashFiles('Cargo.lock') }}
+      - name: Check formatting
+        if: matrix.rust == '1.88.0'
+        run: cargo +${{ matrix.rust }} fmt --all -- --check
+      - name: Lint
+        run: cargo +${{ matrix.rust }} clippy --locked --all-targets --all-features -- -D warnings
+      - name: Unit tests and example compilation
+        run: cargo +${{ matrix.rust }} test --locked --all-targets --all-features
+      - name: Documentation tests
+        run: cargo +${{ matrix.rust }} test --locked --doc --all-features
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +${{ matrix.rust }} doc --locked --no-deps --all-features
+      - name: PostgreSQL integration tests
+        run: cargo +${{ matrix.rust }} test --locked --lib -- --ignored --test-threads=1
+      - name: Run example against a fresh database
+        run: |
+          PGPASSWORD=test-only createdb -h localhost -U postgres cache_example
+          cargo +${{ matrix.rust }} run --locked --example basic
+      - name: Verify publishable archive
+        run: cargo +${{ matrix.rust }} publish --locked --dry-run

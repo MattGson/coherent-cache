@@ -1,0 +1,30 @@
+[package]
+name = "coherent-cache"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/coherent-cache"
+repository = "https://github.com/MattGson/coherent-cache"
+keywords = ["cache", "postgres", "sea-orm", "invalidation", "async"]
+categories = ["caching", "database", "asynchronous"]
+include = ["src/**", "examples/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE-*", "CHANGELOG.md"]
+description = "Typed process-local SeaORM caches coordinated through PostgreSQL"
+
+[dependencies]
+anyhow = "1"
+moka = { version = "0.12", features = ["future"] }
+sea-orm = { version = "1.1", default-features = false, features = ["runtime-tokio-native-tls", "sqlx-postgres"] }
+sea-orm-migration = { version = "1.1", default-features = false, features = ["runtime-tokio-native-tls", "sqlx-postgres"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-native-tls", "postgres"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+futures = "0.3"
+sea-orm = { version = "1.1", default-features = false, features = ["macros", "with-uuid"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
