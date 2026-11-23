@@ -68,7 +68,7 @@ coherent_cache::cacheable!(users::Entity, pub enum UserKey {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let db = Arc::new(Database::connect(std::env::var("DATABASE_URL")?).await?);
-    // Demo setup only. In production, install frozen definitions in a migration.
+    // Demo setup only. In production, create the table and install triggers in a migration.
     db.execute_unprepared(
         "CREATE TABLE IF NOT EXISTS cache_example_users (id integer PRIMARY KEY, name text NOT NULL)",
     )
@@ -83,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
     let listener_cache = cache.clone();
     let listener = tokio::spawn(async move { listener_cache.run_listener(shutdown).await });
 
-    // Reads safely use the loader until the listener has established its health lease.
+    // Reads use the database until the listener is ready.
     let users = cache.entity::<users::Entity>();
     let before: Option<users::Model> = users
         .get_or_load(UserKey::Id(1), || async {
@@ -139,48 +139,35 @@ JSON representation of that column; arbitrary expressions/composite keys are not
 
 ## Writes and recovery
 
-Generated row triggers derive affected keys from both row images, covering insert, update, delete,
-negative results, aliases, and workspace collections. Unchanged rows produce no keyed notification.
-`TRUNCATE` invalidates the entire entity. Changes are deduplicated in a transaction-local setting,
-not a durable table; rollback/savepoints discard their changes. The commit wrapper reads that setting
-before commit and invalidates locally before returning, even if the caller cancels or commit fails
-ambiguously. Do not commit manually or overwrite the library's settings through `connection()`.
+PostgreSQL tracks changes made by your application or external SQL. Committed
+changes invalidate the affected cached results, including cached "not found"
+results and collections. Rolled-back writes do not affect other processes' caches.
 
-A dedicated listener consumes only the keyed protocol. It ignores its own process's notifications,
-which the commit wrapper handles. A private notification heartbeat runs every five seconds with a
-five-second deadline. Cached reads require a health lease younger than 15 seconds. Failures bypass
-caching; resubscription clears all entries before enabling hits. Idle lease renewal on the same
-healthy connection preserves unaffected entries. In-flight fills cannot return stale pre-invalidation
-data. Missed invalidations that escape detection are bounded by TTL; this is eventual consistency,
-not a substitute for authoritative database reads in cross-node concurrency decisions.
+Wrap application writes in `begin_write()` and finish with `CacheWrite::commit()`.
+Affected local entries are invalidated before commit returns. If the caller is
+cancelled while commit is in progress, invalidation still completes.
 
-The listener uses a private one-connection pool and session-local statement, idle-in-transaction and
-TCP keepalive timeouts. These settings cannot leak into normal application transactions.
+The cache continuously checks that notifications are working. When it detects a
+connection problem, reads fall back to the database. After reconnecting, it clears
+old entries before serving cached results again. If a result is invalidated while
+loading, the read retries instead of returning it.
 
-## Migration and rollout
+Updates reach other processes asynchronously. Every cached value also expires
+after its configured TTL, limiting staleness if a notification is missed.
 
-Install `schema::track_keyed::<Entity>` in a migration, or use `track_keyed_table` with frozen table
-and column definitions so historical migrations do not follow future entity changes. Install the
-migration before deploying the new app. Startup/reconnect validation rejects missing, disabled or
-mismatched triggers. Ordinary reads never poll generations.
+## Database setup
 
-New installations only need the keyed helpers; `bootstrap`, `track`, and write-observation
-helpers are legacy compatibility APIs. Existing generation/notification infrastructure
-can remain for older revisions during rollout. V2 does
-not consume those notifications or reconcile its counters. It adds no tables, log retention or
-pruning. Remove legacy infrastructure only in a separate migration after all older revisions retire;
-rolling back the keyed migration preserves legacy behavior but requires rolling back the app too.
+Install triggers for each cached table in a database migration using
+`schema::track_keyed::<Entity>`. To keep migrations independent of future entity
+changes, use `schema::track_keyed_table` with explicit table and column definitions.
 
-The transaction-local key set grows with distinct keys touched by a transaction. Keep bulk writes
-bounded; it is not a general-purpose CDC stream. Notification payloads contain key identifiers, not
-cached values. Diagnostics expose no keys or row data, and report key invalidations rather than
-counts of business writes. Remote timing includes remaining transaction time and assumes aligned clocks.
+Apply the migration before starting the application. `validate_schema()` checks
+that the required triggers are installed, enabled, and match your cache keys.
 
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for CI-equivalent checks and disposable
 PostgreSQL setup, and [RELEASING.md](RELEASING.md) for publishing instructions.
-
 
 `cargo test -p coherent-cache` runs unit tests. PostgreSQL tests need a disposable database:
 
