@@ -1,11 +1,59 @@
 # coherent-cache
 
-Typed, process-local read-through caching for SeaORM applications, with targeted
-invalidation coordinated through PostgreSQL transactions and `LISTEN`/`NOTIFY`.
+A low-latency, eventually consistent in-memory cache for Rust applications using
+SeaORM and PostgreSQL. Reduce database load and serve repeated reads directly from
+application memory, with automatic invalidation across application instances.
 
-Each process owns a bounded in-memory store. PostgreSQL triggers notify other
-processes when the row-column keys they depend on change. Loaders keep database
-queries, filtering, and domain conversion in your application.
+No additional services to deploy. `coherent-cache` uses your existing PostgreSQL
+database to coordinate changes, while each application instance keeps its own
+local cache.
+
+## Features
+
+- **Fast local reads.** Cache hits return from memory without a database query or
+  network round trip. On a miss, the cache runs your async loader and stores the
+  result.
+
+- **Automatic, targeted invalidation.** Committed database changes invalidate
+  affected keys across application instances, preserving unrelated cached results.
+  Database triggers track writes from your application, background jobs, and
+  external SQL.
+
+- **Request coalescing.** Concurrent misses for the same key within an instance
+  share a single in-flight load while caching is enabled. This avoids duplicate
+  queries when a popular entry expires or is invalidated.
+
+- **Controlled database load.** A configurable concurrency limit bounds how many
+  loaders can run at once, including when reads fall back to the database.
+
+- **Automatic failure recovery.** The cache monitors its notification connection.
+  When it detects a failure, reads fall back to the database. It reconnects
+  automatically and clears old entries before resuming caching.
+
+- **Reliable writes.** The transaction wrapper invalidates affected local entries
+  before commit returns, even if the caller is cancelled during commit. Reads
+  invalidated while loading retry rather than returning the invalidated result.
+
+- **Typed keys and flexible results.** Cache individual records, collections, and
+  "not found" results. You define the keys and loaders, keeping queries, filtering,
+  and domain conversion in your application.
+
+- **Configurable capacity and expiration.** Set an entry limit and TTL to control
+  cache growth and how long values can remain cached.
+
+- **Built-in diagnostics.** Inspect hits, misses, loader errors, invalidations,
+  and listener health to understand cache behavior in production.
+
+## Consistency
+
+Each application instance caches independently. PostgreSQL notifications propagate
+committed changes asynchronously, so another instance may briefly serve an older
+value before receiving the invalidation. TTL provides an additional expiration
+bound if a notification is missed.
+
+Use direct database reads where stronger consistency is required. Automatic
+invalidation covers the declared table and key dependencies; changes to joined
+tables or time-dependent results need separate handling.
 
 ## Status and installation
 
