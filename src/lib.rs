@@ -400,7 +400,7 @@ impl<E: Cacheable> EntityScope<E> {
                     None
                 } else {
                     state.lookups += 1;
-                    if state.lookups % 256 == 0 {
+                    if state.lookups.is_multiple_of(256) {
                         prune_key_slots(&mut state, &self.coherence.0.data);
                     }
                     let slot = state
