@@ -73,94 +73,154 @@ OpenSSL development headers and `pkg-config`.
 
 ## Quick start
 
-The complete example below defines a SeaORM entity, installs the keyed triggers,
-starts the listener, reads through the cache, and commits a write. It can be run
-against a disposable database:
+This example separates the entity, database migration, application startup, and
+repository functions. The snippets below correspond to the files in the
+[runnable example](examples/basic.rs).
 
-```sh
-DATABASE_URL=postgres://localhost/cache_example cargo run --locked --example basic
+For a consuming application, add these dependencies alongside `coherent-cache`:
+
+```toml
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+sea-orm = { version = "1.1", default-features = false, features = ["macros", "runtime-tokio-native-tls", "sqlx-postgres"] }
+sea-orm-migration = { version = "1.1", default-features = false, features = ["runtime-tokio-native-tls", "sqlx-postgres"] }
 ```
 
-For a consuming application, also add `anyhow = "1"`,
-`tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }`,
-`sea-orm = { version = "1.1", default-features = false, features = ["macros", "runtime-tokio-native-tls", "sqlx-postgres"] }`,
-and `sea-orm-migration = { version = "1.1", default-features = false, features = ["runtime-tokio-native-tls", "sqlx-postgres"] }`.
+### 1. Define the entity and cache keys
+
+In [users.rs](examples/basic/users.rs), define a normal SeaORM entity and declare
+which column identifies a cached lookup. Here, each user is cached by ID.
 
 ```rust,no_run
-use coherent_cache::{schema, CacheCoherence};
-use sea_orm::{entity::prelude::*, ActiveValue::Set, Database};
-use sea_orm_migration::SchemaManager;
-use std::sync::Arc;
-use tokio::sync::watch;
+use sea_orm::entity::prelude::*;
 
-mod users {
-    use sea_orm::entity::prelude::*;
-
-    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "cache_example_users")]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub id: i32,
-        pub name: String,
-    }
-
-    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-    impl ActiveModelBehavior for ActiveModel {}
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+#[sea_orm(table_name = "cache_example_users")]
+pub struct Model {
+    #[sea_orm(primary_key)]
+    pub id: i32,
+    pub name: String,
 }
 
-coherent_cache::cacheable!(users::Entity, pub enum UserKey {
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+impl ActiveModelBehavior for ActiveModel {}
+
+coherent_cache::cacheable!(Entity, pub enum UserKey {
     Id(i32) => ("id", "By ID"),
 });
+```
+
+### 2. Create the table and install invalidation triggers
+
+In [migration.rs](examples/basic/migration.rs), use a SeaORM migration to create
+the table and register its cache keys. The table and column names are defined in
+the migration so later entity changes do not alter its behavior.
+
+If your application already has a migrator, add this migration to its existing
+list instead of defining a second `Migrator`.
+
+```rust,no_run
+use coherent_cache::{schema, KeyIndex, TableIdentity};
+use sea_orm_migration::prelude::*;
+
+pub struct Migrator;
+
+#[async_trait::async_trait]
+impl MigratorTrait for Migrator {
+    fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+        vec![Box::new(Migration)]
+    }
+}
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(Users::Table)
+                    .col(
+                        ColumnDef::new(Users::Id)
+                            .integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(Users::Name).string().not_null())
+                    .to_owned(),
+            )
+            .await?;
+
+        schema::track_keyed_table(
+            manager,
+            &TableIdentity::new("public", "cache_example_users"),
+            &[KeyIndex::new("id", "By ID")],
+        )
+        .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        schema::untrack_keyed_table(
+            manager,
+            &TableIdentity::new("public", "cache_example_users"),
+        )
+        .await?;
+        manager
+            .drop_table(Table::drop().table(Users::Table).to_owned())
+            .await
+    }
+}
+
+#[derive(DeriveIden)]
+enum Users {
+    #[sea_orm(iden = "cache_example_users")]
+    Table,
+    Id,
+    Name,
+}
+```
+
+### 3. Set up the application
+
+Create one cache at startup, register the entity, and start its notification
+listener. Share the database and cache handles with your application services.
+This [main function](examples/basic.rs) calls the read and write functions defined
+below, then shuts the listener down.
+
+```rust,ignore
+mod migration;
+mod repository;
+mod users;
+
+use coherent_cache::CacheCoherence;
+use repository::{create_user, get_user};
+use sea_orm::Database;
+use sea_orm_migration::MigratorTrait;
+use std::sync::Arc;
+use tokio::sync::watch;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let db = Arc::new(Database::connect(std::env::var("DATABASE_URL")?).await?);
-    // Demo setup only. In production, create the table and install triggers in a migration.
-    db.execute_unprepared(
-        "CREATE TABLE IF NOT EXISTS cache_example_users (id integer PRIMARY KEY, name text NOT NULL)",
-    )
-    .await?;
-    schema::track_keyed::<users::Entity>(&SchemaManager::new(db.as_ref())).await?;
+    migration::Migrator::up(db.as_ref(), None).await?;
 
     let cache = CacheCoherence::builder(db.clone())
         .register::<users::Entity>()
         .build();
     cache.validate_schema().await?;
+
     let (stop, shutdown) = watch::channel(false);
     let listener_cache = cache.clone();
     let listener = tokio::spawn(async move { listener_cache.run_listener(shutdown).await });
 
-    // Reads use the database until the listener is ready.
-    let users = cache.entity::<users::Entity>();
-    let before: Option<users::Model> = users
-        .get_or_load(UserKey::Id(1), || async {
-            Ok(users::Entity::find_by_id(1).one(db.as_ref()).await?)
-        })
-        .await?;
-    println!("Before: {before:?}");
-
-    let write = users.begin_write().await?;
-    users::Entity::insert(users::ActiveModel {
-        id: Set(1),
-        name: Set("Ada".to_owned()),
-    })
-    .on_conflict(
-        sea_orm::sea_query::OnConflict::column(users::Column::Id)
-            .update_column(users::Column::Name)
-            .to_owned(),
-    )
-    .exec(write.connection())
-    .await?;
-    write.commit().await?;
-
-    let after: Option<users::Model> = users
-        .get_or_load(UserKey::Id(1), || async {
-            Ok(users::Entity::find_by_id(1).one(db.as_ref()).await?)
-        })
-        .await?;
-    assert_eq!(after.as_ref().map(|user| user.name.as_str()), Some("Ada"));
-    println!("After commit: {after:?}");
+    let id = create_user(&cache, "Ada").await?;
+    let user = get_user(db.as_ref(), &cache, id).await?;
+    assert_eq!(user.as_ref().map(|user| user.name.as_str()), Some("Ada"));
+    println!("Created user: {user:?}");
 
     stop.send(true)?;
     listener.await?;
@@ -168,10 +228,63 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-Keep the shutdown sender alive for the lifetime of the listener. Without a running,
-healthy listener, reads use the database loader and do not populate or serve the
-cache. `validate_schema()` checks trigger installation; it does not start the listener.
-Use the diagnostics snapshot to observe listener health.
+The example runs migrations at startup; an application can instead run them as a
+deployment step. Reads use the database until the listener is ready. Keep the
+shutdown sender alive while the application is running, and signal it when the
+application shuts down.
+
+### 4. Read through the cache
+
+In [repository.rs](examples/basic/repository.rs), wrap the database query with
+`get_or_load`. The loader runs on a cache miss or while caching is unavailable.
+Both a found user and a missing result (`None`) can be cached.
+
+```rust,ignore
+use crate::users::{self, UserKey};
+use coherent_cache::CacheCoherence;
+use sea_orm::{ActiveValue::Set, DatabaseConnection, EntityTrait};
+
+pub async fn get_user(
+    db: &DatabaseConnection,
+    cache: &CacheCoherence,
+    id: i32,
+) -> anyhow::Result<Option<users::Model>> {
+    cache
+        .entity::<users::Entity>()
+        .get_or_load(UserKey::Id(id), || async {
+            Ok(users::Entity::find_by_id(id).one(db).await?)
+        })
+        .await
+}
+```
+
+### 5. Write in a cache-aware transaction
+
+Add this function to the same repository module. Run the insert using the write
+transaction's connection, then commit through the wrapper. It returns the new
+user's database-generated ID after affected local entries have been invalidated.
+
+```rust,ignore
+pub async fn create_user(cache: &CacheCoherence, name: &str) -> anyhow::Result<i32> {
+    let write = cache.entity::<users::Entity>().begin_write().await?;
+    let inserted = users::Entity::insert(users::ActiveModel {
+        name: Set(name.to_owned()),
+        ..Default::default()
+    })
+    .exec(write.connection())
+    .await?;
+
+    write.commit().await?;
+    Ok(inserted.last_insert_id)
+}
+```
+
+To run the complete example from this repository against a disposable PostgreSQL
+database:
+
+```sh
+DATABASE_URL=postgres://localhost/cache_example cargo run --locked --example basic
+```
 
 ## Cache configuration and keys
 
